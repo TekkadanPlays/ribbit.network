@@ -6,12 +6,16 @@ import { healthRoute } from './routes/health';
 import { relaysRoute } from './routes/relays';
 import { cacheRoute } from './routes/cache';
 import { getDb, getEventCount } from './db';
+import { startMonitor } from './monitor/probe';
 
 const app = new Hono();
 
 // Initialize database on startup
 const db = getDb();
 console.log(`📦 SQLite database initialized (${getEventCount()} cached events)`);
+
+// Start relay monitor (background probe engine)
+startMonitor();
 
 app.use('*', logger());
 

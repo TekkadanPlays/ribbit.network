@@ -30,3 +30,12 @@ export type { RelayEntry } from './relay-lists';
 
 export { upsertContactList, getContactList, getFollowingSet } from './contacts';
 export type { ContactEntry } from './contacts';
+
+// Relay monitor
+export {
+  initMonitorTables, upsertRelays, saveCheckResult, saveCheckResults,
+  getRelays, getRelayState, getRelayHistory,
+  getRelaysBySoftware, getRelaysByNip, getRelaysByNetwork,
+  getMonitorStats, getAllRelayUrls, getOnlineRelayUrls,
+} from './monitor';
+export type { RelayCheck, RelayRow } from './monitor';

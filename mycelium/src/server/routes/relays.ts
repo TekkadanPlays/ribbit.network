@@ -1,193 +1,194 @@
 import { Hono } from 'hono';
+import {
+  getRelays, getRelayState, getRelayHistory,
+  getRelaysBySoftware, getRelaysByNip, getRelaysByNetwork,
+  getMonitorStats, getOnlineRelayUrls,
+  type RelayRow,
+} from '../db/monitor';
 
-// Relay discovery API — proxies to local rstate instance
-// rstate runs on a separate port (default 3100) and is not exposed publicly.
-// This route provides a clean /api/relays/* interface through ribbit's Hono server.
-
-const RSTATE_URL = process.env.RSTATE_URL || 'http://127.0.0.1:3100';
-const RSTATE_TIMEOUT = 10000;
+// ---------------------------------------------------------------------------
+// Relay discovery API — native, powered by local SQLite monitor
+// ---------------------------------------------------------------------------
+// Replaces the rstate proxy. Same endpoint shapes so the frontend
+// Nip66Client works unchanged.
 
 export const relaysRoute = new Hono();
 
-// Proxy helper — forwards request to rstate and returns the response
-async function proxy(
-  rstatePath: string,
-  init?: RequestInit,
-): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), RSTATE_TIMEOUT);
-  try {
-    const res = await fetch(`${RSTATE_URL}${rstatePath}`, {
-      ...init,
-      signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        ...init?.headers,
-      },
-    });
-    return res;
-  } catch (err: any) {
-    if (err.name === 'AbortError') {
-      return new Response(JSON.stringify({ error: 'rstate timeout' }), {
-        status: 504,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-    return new Response(JSON.stringify({ error: 'rstate unavailable' }), {
-      status: 502,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+// Helper: transform a RelayRow into the rstate-compatible JSON shape
+// that Nip66Client / the frontend expects
+function toRelayState(r: RelayRow) {
+  let nips: number[] = [];
+  try { nips = JSON.parse(r.nips || '[]'); } catch {}
+  let nip11: Record<string, any> = {};
+  try { nip11 = JSON.parse(r.nip11_json || '{}'); } catch {}
+
+  const uptime = r.check_count > 0 ? r.online_count / r.check_count : 0;
+
+  return {
+    relayUrl: r.url,
+    network: { value: r.network || 'clearnet' },
+    software: {
+      family: { value: r.software || 'unknown' },
+      version: { value: r.version || '' },
+    },
+    rtt: {
+      open: { value: r.rtt_open > 0 ? r.rtt_open : null },
+      read: { value: r.rtt_read > 0 ? r.rtt_read : null },
+    },
+    nips: { list: nips },
+    info: nip11,
+    online: !!r.online,
+    uptime: Math.round(uptime * 10000) / 100, // percentage with 2 decimals
+    updated_at: r.checked_at || 0,
+    firstSeenAt: r.first_seen || 0,
+    lastSeenAt: r.last_online || 0,
+    lastOpenAt: r.online ? r.checked_at : (r.last_online || 0),
+    checkCount: r.check_count || 0,
+  };
 }
 
-// GET /relays/health — rstate health check
-relaysRoute.get('/relays/health', async (c) => {
-  const res = await proxy('/health/ping');
-  const data = await res.json();
-  return c.json(data, res.status as any);
+// GET /relays/health — monitor health
+relaysRoute.get('/relays/health', (c) => {
+  const stats = getMonitorStats();
+  return c.json({
+    status: 'ok',
+    monitor: 'mycelium-native',
+    ...stats,
+  });
 });
 
 // GET /relays — list relays with pagination and sorting
-relaysRoute.get('/relays', async (c) => {
-  // Forward all query params to rstate
-  const url = new URL(c.req.url, 'http://localhost');
-  const qs = url.search; // includes leading '?'
-  const res = await proxy(`/relays${qs}`);
-  const data = await res.json();
-  return c.json(data, res.status as any);
+relaysRoute.get('/relays', (c) => {
+  const limit = Math.min(parseInt(c.req.query('limit') || '50', 10), 500);
+  const offset = parseInt(c.req.query('offset') || '0', 10);
+  const sortBy = c.req.query('sortBy') || 'rtt_open';
+  const sortOrder = (c.req.query('sortOrder') || 'asc') as 'asc' | 'desc';
+  const format = c.req.query('format');
+
+  const { relays: rows, total } = getRelays({ limit, offset, sortBy, sortOrder });
+
+  const relays = rows.map(toRelayState);
+
+  return c.json({ relays, total, limit, offset });
 });
 
-// GET /relays/state — get single relay state
-relaysRoute.get('/relays/state', async (c) => {
+// GET /relays/state — single relay detail
+relaysRoute.get('/relays/state', (c) => {
   const relayUrl = c.req.query('relayUrl');
-  if (!relayUrl) {
-    return c.json({ error: 'relayUrl query parameter required' }, 400);
-  }
-  const res = await proxy(`/relays/state?relayUrl=${encodeURIComponent(relayUrl)}`);
-  const data = await res.json();
-  return c.json(data, res.status as any);
+  if (!relayUrl) return c.json({ error: 'relayUrl query parameter required' }, 400);
+
+  const row = getRelayState(relayUrl);
+  if (!row) return c.json({ error: 'Relay not found' }, 404);
+
+  const state = toRelayState(row);
+  const history = getRelayHistory(relayUrl);
+
+  return c.json({ ...state, history });
 });
 
-// POST /relays/search — search relays by filter
+// POST /relays/search — search by NIPs, software, latency
 relaysRoute.post('/relays/search', async (c) => {
-  const body = await c.req.text();
-  const res = await proxy('/relays/search', { method: 'POST', body });
-  const data = await res.json();
-  return c.json(data, res.status as any);
+  const body = await c.req.json() as {
+    filter?: { nips?: number[]; network?: string[]; software?: string; maxLatency?: number };
+    limit?: number; offset?: number;
+  };
+
+  const limit = Math.min(body.limit || 100, 500);
+  const offset = body.offset || 0;
+
+  // Get all relays sorted by RTT, then filter in-memory
+  // (SQLite JSON filtering is clunky, and we're dealing with <5000 relays max)
+  const { relays: rows } = getRelays({ limit: 5000, sortBy: 'rtt_open', sortOrder: 'asc' });
+
+  let filtered = rows;
+  const f = body.filter;
+
+  if (f) {
+    if (f.network && f.network.length > 0) {
+      filtered = filtered.filter((r) => f.network!.includes(r.network || 'clearnet'));
+    }
+    if (f.software) {
+      const sw = f.software.toLowerCase();
+      filtered = filtered.filter((r) => (r.software || '').toLowerCase().includes(sw));
+    }
+    if (f.maxLatency && f.maxLatency > 0) {
+      filtered = filtered.filter((r) => r.online && r.rtt_open > 0 && r.rtt_open <= f.maxLatency!);
+    }
+    if (f.nips && f.nips.length > 0) {
+      filtered = filtered.filter((r) => {
+        try {
+          const relayNips: number[] = JSON.parse(r.nips || '[]');
+          return f.nips!.every((n) => relayNips.includes(n));
+        } catch { return false; }
+      });
+    }
+  }
+
+  const total = filtered.length;
+  const paged = filtered.slice(offset, offset + limit);
+
+  return c.json({ relays: paged.map(toRelayState), total, limit, offset });
 });
 
 // POST /relays/online — find online relays
-relaysRoute.post('/relays/online', async (c) => {
-  const body = await c.req.text();
-  const res = await proxy('/relays/online', { method: 'POST', body });
-  const data = await res.json();
-  return c.json(data, res.status as any);
-});
-
-// POST /relays/nearby — geospatial relay search
-relaysRoute.post('/relays/nearby', async (c) => {
-  const body = await c.req.text();
-  const res = await proxy('/relays/nearby', { method: 'POST', body });
-  const data = await res.json();
-  return c.json(data, res.status as any);
+relaysRoute.post('/relays/online', (c) => {
+  const relays = getOnlineRelayUrls();
+  return c.json({ relays });
 });
 
 // GET /relays/by/software — group by software
-relaysRoute.get('/relays/by/software', async (c) => {
-  const res = await proxy('/relays/by/software');
-  const data = await res.json();
-  return c.json(data, res.status as any);
+relaysRoute.get('/relays/by/software', (c) => {
+  return c.json(getRelaysBySoftware());
 });
 
 // GET /relays/by/nip — group by NIP support
-relaysRoute.get('/relays/by/nip', async (c) => {
-  const res = await proxy('/relays/by/nip');
-  const data = await res.json();
-  return c.json(data, res.status as any);
+relaysRoute.get('/relays/by/nip', (c) => {
+  return c.json(getRelaysByNip());
 });
 
-// GET /relays/by/country — group by country
-relaysRoute.get('/relays/by/country', async (c) => {
-  const res = await proxy('/relays/by/country');
-  const data = await res.json();
-  return c.json(data, res.status as any);
+// GET /relays/by/network — group by network type
+relaysRoute.get('/relays/by/network', (c) => {
+  return c.json(getRelaysByNetwork());
 });
 
 // POST /relays/compare — compare multiple relays
 relaysRoute.post('/relays/compare', async (c) => {
-  const body = await c.req.text();
-  const res = await proxy('/relays/compare', { method: 'POST', body });
-  const data = await res.json();
-  return c.json(data, res.status as any);
+  const body = await c.req.json() as { urls: string[] };
+  if (!body.urls || !Array.isArray(body.urls)) {
+    return c.json({ error: 'urls array required' }, 400);
+  }
+
+  const relays = body.urls.map((url) => {
+    const row = getRelayState(url);
+    return row ? toRelayState(row) : null;
+  });
+
+  return c.json({ relays });
 });
 
-// POST /relays/offline — find offline relays
-relaysRoute.post('/relays/offline', async (c) => {
-  const body = await c.req.text();
-  const res = await proxy('/relays/offline', { method: 'POST', body });
-  const data = await res.json();
-  return c.json(data, res.status as any);
+// GET /relays/history — RTT history for sparklines
+relaysRoute.get('/relays/history', (c) => {
+  const relayUrl = c.req.query('relayUrl');
+  if (!relayUrl) return c.json({ error: 'relayUrl required' }, 400);
+  const hours = parseInt(c.req.query('hours') || '24', 10);
+  return c.json(getRelayHistory(relayUrl, hours));
 });
 
-// POST /relays/dead — find dead relays
-relaysRoute.post('/relays/dead', async (c) => {
-  const body = await c.req.text();
-  const res = await proxy('/relays/dead', { method: 'POST', body });
-  const data = await res.json();
-  return c.json(data, res.status as any);
+// GET /monitors — stub for compatibility (we are the only monitor)
+relaysRoute.get('/monitors', (c) => {
+  const stats = getMonitorStats();
+  return c.json({
+    monitors: [{
+      name: 'mycelium-native',
+      pubkey: null,
+      totalRelays: stats.totalRelays,
+      onlineRelays: stats.onlineRelays,
+      lastCheckAt: stats.lastCheckAt,
+    }],
+  });
 });
 
-// GET /relays/nearby — geospatial relay search
-relaysRoute.get('/relays/nearby', async (c) => {
-  const url = new URL(c.req.url, 'http://localhost');
-  const res = await proxy(`/relays/nearby${url.search}`);
-  const data = await res.json();
-  return c.json(data, res.status as any);
-});
-
-// GET /relays/labels — get labels for a specific relay
-relaysRoute.get('/relays/labels', async (c) => {
-  const url = new URL(c.req.url, 'http://localhost');
-  const res = await proxy(`/relays/labels${url.search}`);
-  const data = await res.json();
-  return c.json(data, res.status as any);
-});
-
-// GET /relays/labels/list — list all available labels
-relaysRoute.get('/relays/labels/list', async (c) => {
-  const res = await proxy('/relays/labels/list');
-  const data = await res.json();
-  return c.json(data, res.status as any);
-});
-
-// GET /relays/by/label — find relays with a specific label
-relaysRoute.get('/relays/by/label', async (c) => {
-  const url = new URL(c.req.url, 'http://localhost');
-  const res = await proxy(`/relays/by/label${url.search}`);
-  const data = await res.json();
-  return c.json(data, res.status as any);
-});
-
-// GET /relays/by/network — group by network type
-relaysRoute.get('/relays/by/network', async (c) => {
-  const res = await proxy('/relays/by/network');
-  const data = await res.json();
-  return c.json(data, res.status as any);
-});
-
-// GET /monitors — list monitors
-relaysRoute.get('/monitors', async (c) => {
-  const res = await proxy('/monitors');
-  const data = await res.json();
-  return c.json(data, res.status as any);
-});
-
-// GET /monitors/:pubkey — get monitor info
-relaysRoute.get('/monitors/:pubkey', async (c) => {
-  const pubkey = c.req.param('pubkey');
-  const res = await proxy(`/monitors/${pubkey}`);
-  const data = await res.json();
-  return c.json(data, res.status as any);
+// GET /monitors/:pubkey — stub
+relaysRoute.get('/monitors/:pubkey', (c) => {
+  return c.json({ error: 'Not implemented — this is a single-instance monitor' }, 404);
 });
