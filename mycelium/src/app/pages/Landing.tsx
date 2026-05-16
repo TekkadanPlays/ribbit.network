@@ -165,10 +165,9 @@ function HeroSection() {
 
       // CTAs
       createElement('div', { className: 'flex flex-wrap justify-center gap-3' },
-        createElement('a', {
-          href: '/feed',
-          onClick: handleFeedClick,
-          className: 'inline-flex items-center gap-2 rounded-lg bg-primary px-6 py-3 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors shadow-lg shadow-primary/20 cursor-pointer',
+        createElement(Link, {
+          to: '/feed',
+          className: 'inline-flex items-center gap-2 rounded-lg bg-primary px-6 py-3 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors shadow-lg shadow-primary/20',
         }, 'Open Feed \u2192'),
         createElement(GlowDocsButton, { label: 'Read the Docs' }),
         createElement('a', {
@@ -294,10 +293,9 @@ function CTASection() {
       'Jump into the feed, explore the docs, or start building with Kaji. No sign-up required \u2014 just a Nostr key.',
     ),
     createElement('div', { className: 'flex flex-wrap justify-center gap-3' },
-      createElement('a', {
-        href: '/feed',
-        onClick: handleFeedClick,
-        className: 'inline-flex items-center gap-2 rounded-lg bg-primary px-6 py-3 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors shadow-lg shadow-primary/20 cursor-pointer',
+      createElement(Link, {
+        to: '/feed',
+        className: 'inline-flex items-center gap-2 rounded-lg bg-primary px-6 py-3 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors shadow-lg shadow-primary/20',
       }, 'Open Feed'),
       createElement(GlowDocsButton, { label: 'Documentation' }),
     ),
