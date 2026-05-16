@@ -14,10 +14,10 @@ import { Input } from '../ui/Input';
 import { Badge } from '../ui/Badge';
 
 // ---------------------------------------------------------------------------
-// Relay Discovery — rstate API with NIP-66 WebSocket fallback
+// Relay Discovery — native monitor with NIP-66 WebSocket fallback
 // ---------------------------------------------------------------------------
-// Primary: ribbit.network proxies rstate at /relays/* endpoints.
-// Fallback: If rstate is unavailable (502), query NIP-66 monitor relays
+// Primary: mycelium's built-in probe engine serves /relays/* from SQLite.
+// Fallback: If the API is unavailable, query NIP-66 monitor relays
 // directly via WebSocket for kind 30166 relay metadata events.
 
 const MONITOR_RELAYS = [
@@ -116,42 +116,49 @@ interface DiscoveryState {
 
 const NA_COUNTRIES = new Set(['US', 'CA']);
 
-// Parse rstate relay object into our RelayInfo
+// Parse rstate/native monitor relay object into our RelayInfo
 function parseRstateRelay(raw: any): RelayInfo {
-  const url = raw.url || raw.relay_url || raw.d || '';
+  const url = raw.relayUrl || raw.url || raw.relay_url || raw.d || '';
   const info = raw.info || raw.nip11 || {};
   const geo = raw.geo || raw.location || {};
   const nips: number[] = [];
-  if (Array.isArray(info.supported_nips)) {
-    for (const n of info.supported_nips) {
-      if (typeof n === 'number') nips.push(n);
-    }
+  // Native monitor: nips.list
+  if (raw.nips && Array.isArray(raw.nips.list)) {
+    for (const n of raw.nips.list) { if (typeof n === 'number') nips.push(n); }
   }
-  if (Array.isArray(raw.supported_nips)) {
-    for (const n of raw.supported_nips) {
-      if (typeof n === 'number' && !nips.includes(n)) nips.push(n);
-    }
+  if (nips.length === 0 && Array.isArray(info.supported_nips)) {
+    for (const n of info.supported_nips) { if (typeof n === 'number') nips.push(n); }
+  }
+  if (nips.length === 0 && Array.isArray(raw.supported_nips)) {
+    for (const n of raw.supported_nips) { if (typeof n === 'number' && !nips.includes(n)) nips.push(n); }
   }
 
-  const sw = info.software || raw.software || '';
+  // Software from native or NIP-11
+  const swRaw = raw.software?.family?.value || info.software || raw.software || '';
+  const sw = swRaw ? (swRaw.split('/').pop() || swRaw) : '';
+  const ver = raw.software?.version?.value || info.version || raw.version || '';
+
+  // RTT from native monitor
+  const rttOpen = raw.rtt?.open?.value ?? null;
+  const rttRead = raw.rtt?.read?.value ?? raw.rtt_read ?? raw.avg_rtt_read ?? null;
 
   return {
     url,
     name: info.name || raw.name || url.replace('wss://', '').replace('ws://', ''),
     description: info.description || raw.description || '',
-    software: sw ? (sw.split('/').pop() || sw) : '',
-    version: info.version || raw.version || '',
+    software: sw,
+    version: ver,
     supportedNips: nips.sort((a, b) => a - b),
     contact: info.contact || raw.contact || '',
     pubkey: info.pubkey || raw.pubkey || '',
     countryCode: geo.country_code || geo.countryCode || raw.country_code || '',
     countryName: geo.country || geo.countryName || raw.country || '',
     city: geo.city || raw.city || '',
-    isOnline: raw.is_online ?? raw.online ?? true,
-    uptimePct: raw.uptime_pct ?? raw.uptime ?? null,
-    rttRead: raw.rtt_read ?? raw.avg_rtt_read ?? raw.rtt?.read ?? null,
-    rttWrite: raw.rtt_write ?? raw.avg_rtt_write ?? raw.rtt?.write ?? null,
-    lastSeen: raw.last_seen ?? raw.created_at ?? 0,
+    isOnline: raw.online ?? raw.is_online ?? true,
+    uptimePct: raw.uptime ?? raw.uptime_pct ?? null,
+    rttRead: rttOpen ?? rttRead,
+    rttWrite: raw.rtt?.write?.value ?? raw.rtt_write ?? raw.avg_rtt_write ?? null,
+    lastSeen: raw.lastSeenAt ?? raw.last_seen ?? raw.created_at ?? 0,
   };
 }
 
@@ -358,7 +365,7 @@ export class RelayDiscovery extends Component<{}, DiscoveryState> {
         createElement('div', null,
           createElement('h1', { className: 'text-xl font-bold tracking-tight' }, 'Discover Relays'),
           createElement('p', { className: 'text-sm text-muted-foreground mt-1' },
-            'Browse relays via rstate (nostr.watch). Filter by country, software, NIPs, or search.',
+            'Browse relays monitored by mycelium. Filter by country, software, NIPs, or search.',
           ),
         ),
         createElement(Link, { to: '/settings/relays' },
@@ -494,7 +501,7 @@ export class RelayDiscovery extends Component<{}, DiscoveryState> {
       createElement('div', { className: 'flex items-center gap-3 text-xs text-muted-foreground' },
         isLoading
           ? createElement('span', { className: 'animate-pulse' },
-              this.state.rstateAvailable ? 'Loading relays from rstate...' : 'Loading relays via NIP-66 monitors...',
+              this.state.rstateAvailable ? 'Loading relays...' : 'Loading relays via NIP-66 monitors...',
             )
           : createElement('span', null,
               filtered.length + ' relay' + (filtered.length !== 1 ? 's' : ''),
@@ -502,7 +509,7 @@ export class RelayDiscovery extends Component<{}, DiscoveryState> {
             ),
         !isLoading && relays.length > 0
           ? createElement('span', { className: 'text-muted-foreground/50' },
-              this.state.rstateAvailable ? 'via rstate' : 'via NIP-66',
+              this.state.rstateAvailable ? 'native monitor' : 'via NIP-66',
             )
           : null,
         error ? createElement('span', { className: 'text-destructive' }, error) : null,
