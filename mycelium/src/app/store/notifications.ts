@@ -1,17 +1,12 @@
+// Notifications Store — Migrated to Preact Signals
+import { signal, effect } from '@preact/signals-core';
 import type { NostrEvent } from '../../nostr/event';
 import { Kind } from '../../nostr/event';
 import { getPool } from './relay';
-import { getAuthState } from './auth';
+import { authPubkey } from './auth';
 import { fetchProfile } from './profiles';
 import { cacheEvent } from '../api/cache';
 import type { PoolSubscription } from '../../nostr/pool';
-
-// ---------------------------------------------------------------------------
-// Notifications Store
-// ---------------------------------------------------------------------------
-// Manages notification events (reactions, replies, mentions, reposts),
-// caches them to the server, tracks seen/unseen via localStorage timestamp,
-// and maintains a live subscription for incoming notifications.
 
 export type NotifType = 'reaction' | 'reply' | 'mention' | 'repost';
 
@@ -25,62 +20,39 @@ export interface Notification {
 export interface NotificationsState {
   notifications: Notification[];
   isLoading: boolean;
-  lastSeenTimestamp: number; // unix timestamp of when user last viewed notifications
+  lastSeenTimestamp: number;
   unseenCount: number;
 }
 
-type Listener = () => void;
-
 const STORAGE_KEY = 'ribbit_notif_last_seen';
 
-let state: NotificationsState = {
+// ─── Signal ───
+
+export const notificationsState = signal<NotificationsState>({
   notifications: [],
   isLoading: false,
   lastSeenTimestamp: 0,
   unseenCount: 0,
-};
+});
 
-const listeners: Set<Listener> = new Set();
 let liveSub: PoolSubscription | null = null;
 let initialSub: PoolSubscription | null = null;
 const seen = new Set<string>();
 
-let notifyScheduled = false;
-function notify() {
-  if (notifyScheduled) return;
-  notifyScheduled = true;
-  queueMicrotask(() => {
-    notifyScheduled = false;
-    for (const fn of listeners) fn();
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+// ─── Actions ───
 
 export function getNotificationsState(): NotificationsState {
-  return state;
+  return notificationsState.value;
 }
 
-export function subscribeNotifications(listener: Listener): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
-}
-
-/** Mark all notifications as seen (updates localStorage timestamp). */
 export function markAllSeen(): void {
   const now = Math.floor(Date.now() / 1000);
-  state = { ...state, lastSeenTimestamp: now, unseenCount: 0 };
-  if (typeof localStorage !== 'undefined') {
-    localStorage.setItem(STORAGE_KEY, String(now));
-  }
-  notify();
+  notificationsState.value = { ...notificationsState.value, lastSeenTimestamp: now, unseenCount: 0 };
+  if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, String(now));
 }
 
-/** Get the unseen count (for badge in nav). */
 export function getUnseenCount(): number {
-  return state.unseenCount;
+  return notificationsState.value.unseenCount;
 }
 
 function loadLastSeen(): number {
@@ -91,7 +63,6 @@ function loadLastSeen(): number {
 
 function classifyEvent(event: NostrEvent, myPubkey: string): Notification | null {
   if (event.pubkey === myPubkey) return null;
-
   const eTag = event.tags.find((t: string[]) => t[0] === 'e');
   const targetId = eTag && eTag[1] ? eTag[1] : null;
 
@@ -104,50 +75,43 @@ function classifyEvent(event: NostrEvent, myPubkey: string): Notification | null
 }
 
 function recalcUnseen() {
-  const unseen = state.notifications.filter(
-    (n) => n.event.created_at > state.lastSeenTimestamp,
-  ).length;
-  state = { ...state, unseenCount: unseen };
+  const s = notificationsState.value;
+  const unseen = s.notifications.filter((n) => n.event.created_at > s.lastSeenTimestamp).length;
+  notificationsState.value = { ...s, unseenCount: unseen };
 }
 
 function addNotification(notif: Notification) {
-  // Array-level dedup guard (in case seen set was cleared between reloads)
-  if (state.notifications.some((n) => n.id === notif.id)) return;
-  state = {
-    ...state,
-    notifications: [notif, ...state.notifications].sort(
+  const s = notificationsState.value;
+  if (s.notifications.some((n) => n.id === notif.id)) return;
+  const updated = {
+    ...s,
+    notifications: [notif, ...s.notifications].sort(
       (a, b) => b.event.created_at - a.event.created_at,
     ),
   };
+  notificationsState.value = updated;
   recalcUnseen();
-  notify();
 }
 
-// ---------------------------------------------------------------------------
-// Load & Subscribe
-// ---------------------------------------------------------------------------
+// ─── Load & Subscribe ───
 
 export function loadNotifications(): void {
-  const auth = getAuthState();
-  if (!auth.pubkey) return;
+  const pubkey = authPubkey.value;
+  if (!pubkey) return;
 
-  // Cleanup previous
   cleanupSubs();
   seen.clear();
 
-  state = {
-    ...state,
+  notificationsState.value = {
     notifications: [],
     isLoading: true,
     lastSeenTimestamp: loadLastSeen(),
     unseenCount: 0,
   };
-  notify();
 
   const pool = getPool();
-  const myPubkey = auth.pubkey;
+  const myPubkey = pubkey;
 
-  // Initial fetch
   initialSub = pool.subscribe(
     [
       { kinds: [Kind.Reaction], '#p': [myPubkey], limit: 100 },
@@ -159,17 +123,13 @@ export function loadNotifications(): void {
       seen.add(event.id);
       fetchProfile(event.pubkey);
       cacheEvent(event);
-
       const notif = classifyEvent(event, myPubkey);
       if (notif) addNotification(notif);
     },
     () => {
       if (initialSub) { initialSub.unsubscribe(); initialSub = null; }
-      state = { ...state, isLoading: false };
+      notificationsState.value = { ...notificationsState.value, isLoading: false };
       recalcUnseen();
-      notify();
-
-      // Start live subscription for new notifications
       startLiveNotifications(myPubkey);
     },
   );
@@ -190,7 +150,6 @@ function startLiveNotifications(myPubkey: string): void {
       seen.add(event.id);
       fetchProfile(event.pubkey);
       cacheEvent(event);
-
       const notif = classifyEvent(event, myPubkey);
       if (notif) addNotification(notif);
     },
@@ -202,15 +161,27 @@ export function cleanupSubs(): void {
   if (liveSub) { liveSub.unsubscribe(); liveSub = null; }
 }
 
-/** Reset all notification state and cancel active subscriptions. */
 export function resetNotifications(): void {
   cleanupSubs();
   seen.clear();
-  state = {
-    notifications: [],
-    isLoading: false,
-    lastSeenTimestamp: 0,
-    unseenCount: 0,
+  notificationsState.value = {
+    notifications: [], isLoading: false, lastSeenTimestamp: 0, unseenCount: 0,
   };
-  notify();
+}
+
+// ─── Legacy compat ───
+
+const _legacyListeners: Set<() => void> = new Set();
+let _bridgeActive = false;
+
+export function subscribeNotifications(listener: () => void): () => void {
+  _legacyListeners.add(listener);
+  if (!_bridgeActive) {
+    _bridgeActive = true;
+    effect(() => {
+      notificationsState.value;
+      for (const fn of _legacyListeners) fn();
+    });
+  }
+  return () => _legacyListeners.delete(listener);
 }

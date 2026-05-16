@@ -1,24 +1,7 @@
+// Indexer Discovery Store — Migrated to Preact Signals
+import { signal, effect } from '@preact/signals-core';
 import { Relay } from '../../nostr/relay';
 import type { NostrEvent } from '../../nostr/event';
-
-// ---------------------------------------------------------------------------
-// Indexer Discovery Store
-// ---------------------------------------------------------------------------
-// Discovers the best indexer relays (by RTT + uptime) for bootstrapping
-// user profile and NIP-65 lookups.
-//
-// Strategy:
-//   1. Try rstate API (production) — POST /relays/search for relays with
-//      low latency and high uptime, sorted by latency.
-//   2. Fallback — well-known indexer relays (instant, always works).
-//
-// After initial bootstrap, a background NIP-66 upgrade can replace the
-// fallback list with dynamically discovered relays.
-//
-// Uses a shared promise so concurrent callers (App init + bootstrapUser)
-// wait for the same result instead of racing.
-
-type Listener = () => void;
 
 export interface IndexerState {
   urls: string[];
@@ -27,37 +10,25 @@ export interface IndexerState {
   error: string | null;
 }
 
-let state: IndexerState = {
+// ─── Signal ───
+
+export const indexerState = signal<IndexerState>({
   urls: [],
   source: 'none',
   isLoading: false,
   error: null,
-};
+});
 
-const listeners: Set<Listener> = new Set();
 let activeDiscovery: Promise<void> | null = null;
 
-let notifyScheduled = false;
-function notify() {
-  if (notifyScheduled) return;
-  notifyScheduled = true;
-  queueMicrotask(() => {
-    notifyScheduled = false;
-    for (const fn of listeners) fn();
-  });
-}
+// ─── Reads ───
 
 export function getIndexerState(): IndexerState {
-  return state;
+  return indexerState.value;
 }
 
 export function getIndexerUrls(): string[] {
-  return state.urls;
-}
-
-export function subscribeIndexers(listener: Listener): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
+  return indexerState.value.urls;
 }
 
 // Well-known relays that are reliable indexers
@@ -70,96 +41,67 @@ const FALLBACK_INDEXERS: string[] = [
   'wss://relay.primal.net',
 ];
 
-// NIP-66 monitor relays for background upgrade
 const MONITOR_RELAYS: string[] = [
   'wss://relay.nostr.watch',
   'wss://history.nostr.watch',
 ];
 
-// ---------------------------------------------------------------------------
-// Discovery — shared promise prevents race conditions
-// ---------------------------------------------------------------------------
+// ─── Actions ───
 
 export function discoverIndexers(count: number = 10): Promise<void> {
-  // Already have results
-  if (state.urls.length > 0 && !state.isLoading) {
-    return Promise.resolve();
-  }
-  // Already in progress — return the same promise
-  if (activeDiscovery) {
-    return activeDiscovery;
-  }
+  if (indexerState.value.urls.length > 0 && !indexerState.value.isLoading) return Promise.resolve();
+  if (activeDiscovery) return activeDiscovery;
 
-  activeDiscovery = doDiscover(count).finally(() => {
-    activeDiscovery = null;
-  });
+  activeDiscovery = doDiscover(count).finally(() => { activeDiscovery = null; });
   return activeDiscovery;
 }
 
 async function doDiscover(count: number): Promise<void> {
-  state = { ...state, isLoading: true, error: null };
-  notify();
+  indexerState.value = { ...indexerState.value, isLoading: true, error: null };
 
-  // 1. Try rstate API (fast, production only)
+  // 1. Try rstate API
   try {
     const urls = await fetchFromRstate(count);
     if (urls.length > 0) {
       console.log('[indexers] Discovered', urls.length, 'relays via rstate');
-      state = { urls, source: 'rstate', isLoading: false, error: null };
-      notify();
+      indexerState.value = { urls, source: 'rstate', isLoading: false, error: null };
       return;
     }
   } catch (err) {
     console.warn('[indexers] rstate unavailable:', err);
   }
 
-  // 2. Instant fallback — use well-known relays immediately
-  // This ensures bootstrap never stalls waiting for NIP-66 WebSocket
+  // 2. Instant fallback
   console.log('[indexers] Using fallback indexers');
-  state = {
+  indexerState.value = {
     urls: FALLBACK_INDEXERS.slice(0, count),
     source: 'fallback',
     isLoading: false,
     error: null,
   };
-  notify();
 
-  // 3. Background: try NIP-66 to upgrade the list (non-blocking)
+  // 3. Background NIP-66 upgrade
   upgradeViaNip66(count);
 }
-
-// ---------------------------------------------------------------------------
-// rstate API
-// ---------------------------------------------------------------------------
 
 async function fetchFromRstate(count: number): Promise<string[]> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5000);
 
   try {
-    // GET /relays with lastSeen sort — gives us recently-active relays with RTT data
     const params = new URLSearchParams({
-      limit: String(count * 3),
-      offset: '0',
-      sortBy: 'lastSeen',
-      sortOrder: 'desc',
-      format: 'detailed',
+      limit: String(count * 3), offset: '0',
+      sortBy: 'lastSeen', sortOrder: 'desc', format: 'detailed',
     });
-    const res = await fetch(`/relays?${params}`, {
-      signal: controller.signal,
-    });
-
+    const res = await fetch(`/relays?${params}`, { signal: controller.signal });
     if (!res.ok) throw new Error(`rstate ${res.status}`);
 
     const data = await res.json();
-    // rstate response: { relays: [...], total, limit, offset }
-    // Each relay has: relayUrl, rtt?.open?.value, network?.value, etc.
     const relays: any[] = data.relays || [];
 
     const scored = relays
       .filter((r: any) => {
         if (!r.relayUrl || !r.relayUrl.startsWith('wss://')) return false;
-        // Only clearnet relays
         if (r.network?.value && r.network.value !== 'clearnet') return false;
         return true;
       })
@@ -168,7 +110,6 @@ async function fetchFromRstate(count: number): Promise<string[]> {
         rtt: r.rtt?.open?.value ?? 9999,
         lastSeen: r.lastSeenAt ?? 0,
       }))
-      // Sort by RTT (lower is better), break ties by recency
       .sort((a, b) => {
         if (a.rtt !== b.rtt) return a.rtt - b.rtt;
         return b.lastSeen - a.lastSeen;
@@ -182,18 +123,11 @@ async function fetchFromRstate(count: number): Promise<string[]> {
       result.push(r.url);
       if (result.length >= count) break;
     }
-
     return result;
   } finally {
     clearTimeout(timer);
   }
 }
-
-// ---------------------------------------------------------------------------
-// NIP-66 background upgrade (non-blocking)
-// ---------------------------------------------------------------------------
-// After fallback indexers are used, this tries to discover better relays
-// via NIP-66 and upgrades the list if successful.
 
 function upgradeViaNip66(count: number) {
   const relayUrls: Map<string, { rtt: number }> = new Map();
@@ -202,7 +136,7 @@ function upgradeViaNip66(count: number) {
 
   function finish() {
     clearTimeout(timeout);
-    if (relayUrls.size === 0) return; // no upgrade available
+    if (relayUrls.size === 0) return;
 
     const sorted = Array.from(relayUrls.entries())
       .sort((a, b) => a[1].rtt - b[1].rtt)
@@ -211,8 +145,7 @@ function upgradeViaNip66(count: number) {
 
     if (sorted.length > 0) {
       console.log('[indexers] Upgraded to', sorted.length, 'relays via NIP-66');
-      state = { urls: sorted, source: 'nip66', isLoading: false, error: null };
-      notify();
+      indexerState.value = { urls: sorted, source: 'nip66', isLoading: false, error: null };
     }
   }
 
@@ -233,9 +166,7 @@ function upgradeViaNip66(count: number) {
             if (rttTag && rttTag[2]) rtt = parseInt(rttTag[2], 10) || 9999;
 
             const existing = relayUrls.get(url);
-            if (!existing || rtt < existing.rtt) {
-              relayUrls.set(url, { rtt });
-            }
+            if (!existing || rtt < existing.rtt) relayUrls.set(url, { rtt });
           },
           () => {
             relay.unsubscribe(subId);
@@ -250,4 +181,21 @@ function upgradeViaNip66(count: number) {
         if (completed >= MONITOR_RELAYS.length) finish();
       });
   }
+}
+
+// ─── Legacy compat ───
+
+const _legacyListeners: Set<() => void> = new Set();
+let _bridgeActive = false;
+
+export function subscribeIndexers(listener: () => void): () => void {
+  _legacyListeners.add(listener);
+  if (!_bridgeActive) {
+    _bridgeActive = true;
+    effect(() => {
+      indexerState.value;
+      for (const fn of _legacyListeners) fn();
+    });
+  }
+  return () => _legacyListeners.delete(listener);
 }

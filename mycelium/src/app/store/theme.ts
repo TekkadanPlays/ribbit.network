@@ -1,6 +1,6 @@
-// ---------------------------------------------------------------------------
 // Theme store — persists base color theme + dark mode to localStorage
-// ---------------------------------------------------------------------------
+// Migrated to Preact Signals
+import { signal, effect } from '@preact/signals-core';
 
 export type BaseTheme =
   | 'neutral' | 'stone' | 'zinc' | 'gray'
@@ -11,16 +11,6 @@ export type BaseTheme =
 const THEME_KEY = 'ribbit_base_theme';
 const DARK_KEY = 'ribbit_dark_mode';
 
-type ThemeListener = () => void;
-let _listeners: ThemeListener[] = [];
-
-function notify() { _listeners.forEach((fn) => fn()); }
-
-export function subscribeTheme(fn: ThemeListener): () => void {
-  _listeners.push(fn);
-  return () => { _listeners = _listeners.filter((l) => l !== fn); };
-}
-
 const VALID_THEMES: Set<string> = new Set([
   'neutral', 'stone', 'zinc', 'gray',
   'amber', 'blue', 'cyan', 'emerald', 'fuchsia', 'green',
@@ -28,53 +18,45 @@ const VALID_THEMES: Set<string> = new Set([
   'rose', 'sky', 'teal', 'violet',
 ]);
 
-export function getBaseTheme(): BaseTheme {
-  const stored = localStorage.getItem(THEME_KEY);
-  if (stored && VALID_THEMES.has(stored)) return stored as BaseTheme;
-  return 'lime';
-}
+// ─── Signals ───
+
+export const baseTheme = signal<BaseTheme>('lime');
+export const darkMode = signal<boolean>(false);
+
+// ─── Actions ───
+
+export function getBaseTheme(): BaseTheme { return baseTheme.value; }
 
 export function setBaseTheme(theme: BaseTheme) {
   localStorage.setItem(THEME_KEY, theme);
+  baseTheme.value = theme;
   applyTheme();
-  notify();
 }
 
-export function isDarkMode(): boolean {
-  const stored = localStorage.getItem(DARK_KEY);
-  if (stored !== null) return stored === 'true';
-  return window.matchMedia('(prefers-color-scheme: dark)').matches;
-}
+export function isDarkMode(): boolean { return darkMode.value; }
 
 export function setDarkMode(dark: boolean) {
   localStorage.setItem(DARK_KEY, String(dark));
+  darkMode.value = dark;
   applyTheme();
-  notify();
 }
 
 export function toggleDarkMode() {
-  setDarkMode(!isDarkMode());
+  setDarkMode(!darkMode.value);
 }
 
 export function applyTheme() {
   const html = document.documentElement;
-  const dark = isDarkMode();
-  const base = getBaseTheme();
+  const dark = darkMode.value;
+  const base = baseTheme.value;
 
-  // Dark mode
-  if (dark) {
-    html.classList.add('dark');
-  } else {
-    html.classList.remove('dark');
-  }
+  if (dark) html.classList.add('dark');
+  else html.classList.remove('dark');
 
-  // Base color theme — remove all theme-* classes, then add current
   Array.from(html.classList)
     .filter((c) => c.startsWith('theme-'))
     .forEach((c) => html.classList.remove(c));
-  if (base !== 'neutral') {
-    html.classList.add(`theme-${base}`);
-  }
+  if (base !== 'neutral') html.classList.add(`theme-${base}`);
 }
 
 // Migrate from old 'theme' key used by the previous ThemeToggle
@@ -94,5 +76,28 @@ function migrateOldKey() {
 // Initialize on load
 export function initTheme() {
   migrateOldKey();
+  // Load stored values into signals
+  const storedTheme = localStorage.getItem(THEME_KEY);
+  if (storedTheme && VALID_THEMES.has(storedTheme)) baseTheme.value = storedTheme as BaseTheme;
+  const storedDark = localStorage.getItem(DARK_KEY);
+  if (storedDark !== null) darkMode.value = storedDark === 'true';
+  else darkMode.value = window.matchMedia('(prefers-color-scheme: dark)').matches;
   applyTheme();
+}
+
+// ─── Legacy compat ───
+
+const _legacyListeners: Set<() => void> = new Set();
+let _bridgeActive = false;
+
+export function subscribeTheme(fn: () => void): () => void {
+  _legacyListeners.add(fn);
+  if (!_bridgeActive) {
+    _bridgeActive = true;
+    effect(() => {
+      baseTheme.value; darkMode.value;
+      for (const fn of _legacyListeners) fn();
+    });
+  }
+  return () => { _legacyListeners.delete(fn); };
 }

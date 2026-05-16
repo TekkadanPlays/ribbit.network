@@ -1,140 +1,134 @@
+import { signal, effect } from '@preact/signals-core';
 import type { NostrEvent } from '../../nostr/event';
 import { Kind, createEvent } from '../../nostr/event';
 import { signWithExtension } from '../../nostr/nip07';
 import { getPool } from './relay';
-import { getAuthState } from './auth';
+import { authPubkey } from './auth';
 import { cacheEvent } from '../api/cache';
 
-type Listener = () => void;
-
 export interface ContactsState {
-  following: Set<string>; // pubkeys the user follows
+  following: Set<string>;
   isLoaded: boolean;
-  contactEvent: NostrEvent | null; // the raw kind-3 event (needed for republishing)
+  contactEvent: NostrEvent | null;
 }
 
-let state: ContactsState = {
+// ─── Signal ───
+
+export const contactsState = signal<ContactsState>({
   following: new Set(),
   isLoaded: false,
   contactEvent: null,
-};
+});
 
-const listeners: Set<Listener> = new Set();
-
-let notifyScheduled = false;
-function notify() {
-  if (notifyScheduled) return;
-  notifyScheduled = true;
-  queueMicrotask(() => {
-    notifyScheduled = false;
-    for (const fn of listeners) fn();
-  });
-}
+// ─── Actions ───
 
 export function getContactsState(): ContactsState {
-  return state;
-}
-
-export function subscribeContacts(listener: Listener): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
+  return contactsState.value;
 }
 
 export function isFollowing(pubkey: string): boolean {
-  return state.following.has(pubkey);
+  return contactsState.value.following.has(pubkey);
 }
 
-/** Clear all contacts state. */
 export function resetContacts(): void {
-  state = { following: new Set(), isLoaded: false, contactEvent: null };
-  notify();
+  contactsState.value = { following: new Set(), isLoaded: false, contactEvent: null };
 }
 
 export function getFollowingList(): string[] {
-  return Array.from(state.following);
+  return Array.from(contactsState.value.following);
 }
 
 // Apply a pre-fetched contacts event (from bootstrap indexer query)
 export function applyContactsEvent(event: NostrEvent) {
-  // Only accept if newer than what we have
-  if (state.contactEvent && state.contactEvent.created_at >= event.created_at) return;
+  const s = contactsState.value;
+  if (s.contactEvent && s.contactEvent.created_at >= event.created_at) return;
   const following = new Set<string>();
   for (const tag of event.tags) {
-    if (tag[0] === 'p' && tag[1]) {
-      following.add(tag[1]);
-    }
+    if (tag[0] === 'p' && tag[1]) following.add(tag[1]);
   }
-  state = { following, isLoaded: true, contactEvent: event };
+  contactsState.value = { following, isLoaded: true, contactEvent: event };
   cacheEvent(event);
-  notify();
 }
 
 export function loadContacts() {
-  const auth = getAuthState();
-  if (!auth.pubkey) return;
+  const pubkey = authPubkey.value;
+  if (!pubkey) return;
 
   const pool = getPool();
   let latest: NostrEvent | null = null;
 
   const sub = pool.subscribe(
-    [{ kinds: [Kind.Contacts], authors: [auth.pubkey] }],
+    [{ kinds: [Kind.Contacts], authors: [pubkey] }],
     (event) => {
-      if (!latest || event.created_at > latest.created_at) {
-        latest = event;
-      }
+      if (!latest || event.created_at > latest.created_at) latest = event;
     },
     () => {
       sub.unsubscribe();
       if (latest) {
         applyContactsEvent(latest);
-      } else if (!state.isLoaded) {
-        state = { following: new Set(), isLoaded: true, contactEvent: null };
-        notify();
+      } else if (!contactsState.value.isLoaded) {
+        contactsState.value = { following: new Set(), isLoaded: true, contactEvent: null };
       }
     },
   );
 }
 
 export async function followUser(pubkey: string): Promise<void> {
-  const auth = getAuthState();
-  if (!auth.pubkey) return;
-  if (state.following.has(pubkey)) return;
+  const myPubkey = authPubkey.value;
+  if (!myPubkey) return;
+  const s = contactsState.value;
+  if (s.following.has(pubkey)) return;
 
-  // Build new tag list from existing + new
-  const tags: string[][] = state.contactEvent
-    ? state.contactEvent.tags.filter((t) => t[0] === 'p')
+  const tags: string[][] = s.contactEvent
+    ? s.contactEvent.tags.filter((t) => t[0] === 'p')
     : [];
   tags.push(['p', pubkey]);
 
-  const content = state.contactEvent?.content || '';
-  const unsigned = createEvent(Kind.Contacts, content, tags, auth.pubkey);
+  const content = s.contactEvent?.content || '';
+  const unsigned = createEvent(Kind.Contacts, content, tags, myPubkey);
   const signed = await signWithExtension(unsigned);
   const pool = getPool();
   await pool.publish(signed);
 
-  const following = new Set(state.following);
+  const following = new Set(s.following);
   following.add(pubkey);
-  state = { following, isLoaded: true, contactEvent: signed };
-  notify();
+  contactsState.value = { following, isLoaded: true, contactEvent: signed };
 }
 
 export async function unfollowUser(pubkey: string): Promise<void> {
-  const auth = getAuthState();
-  if (!auth.pubkey) return;
-  if (!state.following.has(pubkey)) return;
+  const myPubkey = authPubkey.value;
+  if (!myPubkey) return;
+  const s = contactsState.value;
+  if (!s.following.has(pubkey)) return;
 
-  const tags: string[][] = state.contactEvent
-    ? state.contactEvent.tags.filter((t) => !(t[0] === 'p' && t[1] === pubkey))
+  const tags: string[][] = s.contactEvent
+    ? s.contactEvent.tags.filter((t) => !(t[0] === 'p' && t[1] === pubkey))
     : [];
 
-  const content = state.contactEvent?.content || '';
-  const unsigned = createEvent(Kind.Contacts, content, tags, auth.pubkey);
+  const content = s.contactEvent?.content || '';
+  const unsigned = createEvent(Kind.Contacts, content, tags, myPubkey);
   const signed = await signWithExtension(unsigned);
   const pool = getPool();
   await pool.publish(signed);
 
-  const following = new Set(state.following);
+  const following = new Set(s.following);
   following.delete(pubkey);
-  state = { following, isLoaded: true, contactEvent: signed };
-  notify();
+  contactsState.value = { following, isLoaded: true, contactEvent: signed };
+}
+
+// ─── Legacy compat ───
+
+const _legacyListeners: Set<() => void> = new Set();
+let _bridgeActive = false;
+
+export function subscribeContacts(listener: () => void): () => void {
+  _legacyListeners.add(listener);
+  if (!_bridgeActive) {
+    _bridgeActive = true;
+    effect(() => {
+      contactsState.value;
+      for (const fn of _legacyListeners) fn();
+    });
+  }
+  return () => _legacyListeners.delete(listener);
 }

@@ -1,3 +1,6 @@
+// Profile fetching store — resolves kind-0 metadata for any pubkey
+// Migrated to Preact Signals
+import { signal, effect } from '@preact/signals-core';
 import type { NostrEvent } from '../../nostr/event';
 import { Kind } from '../../nostr/event';
 import { getPool } from './relay';
@@ -17,27 +20,19 @@ export interface Profile {
   lastUpdated: number;
 }
 
-type Listener = () => void;
+// ─── Signal ───
+
+// Bumped every time the profile cache changes
+export const profileVersion = signal(0);
 
 const profiles: Map<string, Profile> = new Map();
-const listeners: Set<Listener> = new Set();
 const pendingFetches: Set<string> = new Set();
 
-// Throttle notifications — batch UI updates to avoid thrashing InfernoJS
-let notifyScheduled = false;
-function notify() {
-  if (notifyScheduled) return;
-  notifyScheduled = true;
-  queueMicrotask(() => {
-    notifyScheduled = false;
-    for (const fn of listeners) fn();
-  });
+function notifyProfileChange() {
+  profileVersion.value++;
 }
 
-export function subscribeProfiles(listener: Listener): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
-}
+// ─── Reads ───
 
 export function getProfile(pubkey: string): Profile | undefined {
   return profiles.get(pubkey);
@@ -47,22 +42,23 @@ export function getAllProfiles(): Map<string, Profile> {
   return profiles;
 }
 
+export function getDisplayName(pubkey: string): string {
+  const profile = profiles.get(pubkey);
+  if (profile) return profile.displayName || profile.name || pubkey.slice(0, 8) + '...';
+  return pubkey.slice(0, 8) + '...';
+}
+
+// ─── Internal ───
+
 function parseProfileEvent(event: NostrEvent): Profile {
   let meta: Record<string, string> = {};
-  try {
-    meta = JSON.parse(event.content);
-  } catch { /* ignore */ }
+  try { meta = JSON.parse(event.content); } catch {}
 
   return {
     pubkey: event.pubkey,
-    name: meta.name || '',
-    displayName: meta.display_name || meta.displayName || '',
-    about: meta.about || '',
-    picture: meta.picture || '',
-    banner: meta.banner || '',
-    nip05: meta.nip05 || '',
-    lud16: meta.lud16 || '',
-    lastUpdated: event.created_at,
+    name: meta.name || '', displayName: meta.display_name || meta.displayName || '',
+    about: meta.about || '', picture: meta.picture || '', banner: meta.banner || '',
+    nip05: meta.nip05 || '', lud16: meta.lud16 || '', lastUpdated: event.created_at,
   };
 }
 
@@ -70,34 +66,26 @@ function applyEvent(event: NostrEvent) {
   const existing = profiles.get(event.pubkey);
   if (!existing || event.created_at > existing.lastUpdated) {
     profiles.set(event.pubkey, parseProfileEvent(event));
-    // Write-through to server cache
     cacheEvent(event);
-    notify();
+    notifyProfileChange();
   }
 }
 
 // ---------------------------------------------------------------------------
 // High-performance parallel profile fetcher
 // ---------------------------------------------------------------------------
-// Strategy: fan out kind-0 queries across ALL available sources simultaneously:
-//   1. Pool relays (outbox + any connected relays)
-//   2. Indexer relays (ephemeral connections, best RTT)
-//
-// Each source responds independently → progressive rendering.
-// Chunks large batches into groups of 50 authors per REQ to avoid relay limits.
 
 const batchQueue: Set<string> = new Set();
 let batchTimer: ReturnType<typeof setTimeout> | null = null;
-const BATCH_DELAY = 30; // ms — near-instant batching, just enough to coalesce sync calls
-const CHUNK_SIZE = 50; // max authors per REQ filter
+const BATCH_DELAY = 30;
+const CHUNK_SIZE = 50;
 
-/** Clear all cached profiles and pending fetches. */
 export function resetProfiles(): void {
   profiles.clear();
   pendingFetches.clear();
   batchQueue.clear();
   if (batchTimer) { clearTimeout(batchTimer); batchTimer = null; }
-  notify();
+  notifyProfileChange();
 }
 
 export function fetchProfile(pubkey: string) {
@@ -134,27 +122,20 @@ function flushBatch() {
 
   for (const pk of toFetch) pendingFetches.add(pk);
 
-  // 1. Check server cache first (async, non-blocking)
   getCachedProfiles(toFetch).then((cached) => {
     const remaining: string[] = [];
     for (const pk of toFetch) {
       const hit = cached.get(pk);
       if (hit) {
-        // Hydrate from server cache
         const existing = profiles.get(pk);
         if (!existing || hit.created_at > existing.lastUpdated) {
           let meta: Record<string, string> = {};
-          try { meta = JSON.parse(hit.raw_content); } catch { /* ignore */ }
+          try { meta = JSON.parse(hit.raw_content); } catch {}
           profiles.set(pk, {
             pubkey: pk,
-            name: meta.name || '',
-            displayName: meta.display_name || meta.displayName || '',
-            about: meta.about || '',
-            picture: meta.picture || '',
-            banner: meta.banner || '',
-            nip05: meta.nip05 || '',
-            lud16: meta.lud16 || '',
-            lastUpdated: hit.created_at,
+            name: meta.name || '', displayName: meta.display_name || meta.displayName || '',
+            about: meta.about || '', picture: meta.picture || '', banner: meta.banner || '',
+            nip05: meta.nip05 || '', lud16: meta.lud16 || '', lastUpdated: hit.created_at,
           });
         }
         pendingFetches.delete(pk);
@@ -162,25 +143,21 @@ function flushBatch() {
         remaining.push(pk);
       }
     }
-    if (cached.size > 0) notify();
+    if (cached.size > 0) notifyProfileChange();
 
-    // 2. Query relays for anything not in server cache
     if (remaining.length === 0) return;
     queryRelays(remaining);
   }).catch(() => {
-    // Server unreachable — fall back to relay-only
     queryRelays(toFetch);
   });
 }
 
 function queryRelays(toFetch: string[]) {
-  // Chunk into groups
   const chunks: string[][] = [];
   for (let i = 0; i < toFetch.length; i += CHUNK_SIZE) {
     chunks.push(toFetch.slice(i, i + CHUNK_SIZE));
   }
 
-  // Fan out to all sources simultaneously
   queryViaPool(chunks, toFetch);
   queryViaCrawler(chunks);
   queryViaOutbox(chunks);
@@ -221,20 +198,28 @@ function queryViaOutbox(chunks: string[][]) {
 }
 
 function queryViaCrawler(chunks: string[][]) {
-  // Use the relay crawler to query indexers + popular relays simultaneously
   for (const chunk of chunks) {
     crawl(
       [{ kinds: [Kind.Metadata], authors: chunk }],
       (event) => applyEvent(event),
       { maxRelays: 6, timeout: 5000, preferIndexers: true },
-    ).catch(() => { /* crawler error, no-op */ });
+    ).catch(() => {});
   }
 }
 
-export function getDisplayName(pubkey: string): string {
-  const profile = profiles.get(pubkey);
-  if (profile) {
-    return profile.displayName || profile.name || pubkey.slice(0, 8) + '...';
+// ─── Legacy compat ───
+
+const _legacyListeners: Set<() => void> = new Set();
+let _bridgeActive = false;
+
+export function subscribeProfiles(listener: () => void): () => void {
+  _legacyListeners.add(listener);
+  if (!_bridgeActive) {
+    _bridgeActive = true;
+    effect(() => {
+      profileVersion.value;
+      for (const fn of _legacyListeners) fn();
+    });
   }
-  return pubkey.slice(0, 8) + '...';
+  return () => _legacyListeners.delete(listener);
 }
